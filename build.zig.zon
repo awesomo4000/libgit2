@@ -18,11 +18,17 @@
             .hash = "mbedtls-3.6.4-E4NUR24VAADBF5pt-No-Z90DjozkzySYAgq6eDFy9Xdy",
             .lazy = true,
         },
+        .zg = .{
+            .url = "https://codeberg.org/atman/zg/archive/v0.15.3.tar.gz",
+            .hash = "zg-0.15.2-oGqU3PlHtAIe8e9FTY8FDZcl329U2LYuDvRaREomHIwH",
+            .lazy = true,
+        },
     },
     .paths = .{
         "build.zig",
         "build",
         "build.zig.zon",
+        "src",
         "README.md",
         "LICENSE",
     },

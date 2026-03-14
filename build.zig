@@ -34,9 +34,7 @@ pub fn build(b: *std.Build) !void {
     // Platform features
     switch (target.result.os.tag) {
         .macos => {
-            lib.linkSystemLibrary("iconv");
             features.addValues(.{
-                .GIT_USE_ICONV = 1,
                 .GIT_USE_STAT_MTIMESPEC = 1,
                 .GIT_REGEX_REGCOMP_L = 1,
                 .GIT_QSORT_BSD = 1,
@@ -55,6 +53,30 @@ pub fn build(b: *std.Build) !void {
             });
         },
     }
+
+    // --- Portable iconv shim (NFC normaliser backed by zg) ---
+    // Replaces system libiconv with a pure-Zig implementation so the build
+    // has zero system-library dependencies for iconv, enabling cross-compilation.
+    features.addValues(.{ .GIT_USE_ICONV = 1 });
+    if (b.lazyDependency("zg", .{
+        .target = target,
+        .optimize = optimize,
+    })) |zg_dep| {
+        const iconv_shim = b.addLibrary(.{
+            .name = "iconv_shim",
+            .linkage = .static,
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/iconv_shim.zig"),
+                .target = target,
+                .optimize = optimize,
+                .link_libc = true,
+            }),
+        });
+        iconv_shim.root_module.addImport("Normalize", zg_dep.module("Normalize"));
+        lib.linkLibrary(iconv_shim);
+    }
+    // Stub iconv.h shadows the system header so fs_path.c finds our declarations.
+    lib.addIncludePath(b.path("src"));
 
     const flags = [_][]const u8{
         "-DHAVE_CONFIG_H",
