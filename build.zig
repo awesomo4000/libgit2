@@ -25,11 +25,13 @@ pub fn build(b: *std.Build) !void {
         },
     );
 
-    // @Cleanup: all these platform and TLS variants are starting to become unweildly. Compress these codepaths to avoid edgecases.
+    // --- Build options for subsystem gating ---
+    const enable_transports = b.option(bool, "enable-transports", "Include git transport layer (git://, http://, ssh://, local://)") orelse true;
+    const enable_http = b.option(bool, "enable-http", "Include HTTP parser (llhttp) — requires enable-transports") orelse enable_transports;
+    const enable_ntlm = b.option(bool, "enable-ntlm", "Include NTLM authentication support") orelse enable_transports;
+    const enable_xdiff = b.option(bool, "enable-xdiff", "Include xdiff (merge, diff, apply)") orelse true;
 
-    // @Todo: are there more subtleties for other platforms?
-    // @Todo: do we need iconv on other platforms? original cmake enabled it by
-    // default on APPLE targets
+    // Platform features
     switch (target.result.os.tag) {
         .macos => {
             lib.linkSystemLibrary("iconv");
@@ -55,10 +57,6 @@ pub fn build(b: *std.Build) !void {
     }
 
     const flags = [_][]const u8{
-        // @Todo: for some reason on linux, trying to use c90 as specified in the cmake
-        // files causes compile errors relating to pthreads. Using gnu90 or the
-        // default compiles, so I guess this is fine?
-        // "-std=c90",
         "-DHAVE_CONFIG_H",
         if (target.result.os.tag != .windows)
             "-DGIT_DEFAULT_CERT_LOCATION=\"/etc/ssl/certs/\""
@@ -67,12 +65,14 @@ pub fn build(b: *std.Build) !void {
         "-fno-sanitize=undefined",
     };
 
-    // The TLS backend logic is only run for non windows builds.
+    // --- TLS backend selection ---
+    // "none" means no TLS, no HTTPS, no external crypto dependency.
+    // SHA256 falls back to the builtin RFC 6234 implementation.
     var tls_dep: ?*std.Build.Dependency = null;
     const tls_backend: TlsBackend = b.option(
         TlsBackend,
         "tls-backend",
-        "Choose Unix TLS/SSL backend (default is mbedtls)",
+        "Choose TLS/SSL backend: openssl, mbedtls, securetransport, or none (default: mbedtls, securetransport on macOS)",
     ) orelse if (target.result.os.tag == .macos) .securetransport else .mbedtls;
 
     if (target.result.os.tag == .windows) {
@@ -97,6 +97,17 @@ pub fn build(b: *std.Build) !void {
         lib.addCSourceFiles(.{ .root = libgit_root, .files = &util_win32_sources, .flags = &flags });
     } else {
         switch (tls_backend) {
+            .none => {
+                // No TLS, no HTTPS. Use builtin SHA256 (RFC 6234 reference impl).
+                features.addValues(.{
+                    .GIT_SHA1_COLLISIONDETECT = 1,
+                    .GIT_SHA256_BUILTIN = 1,
+
+                    .GIT_USE_FUTIMENS = 1,
+                    .GIT_IO_POLL = 1,
+                    .GIT_IO_SELECT = 1,
+                });
+            },
             .securetransport => {
                 lib.linkFramework("Security");
                 lib.linkFramework("CoreFoundation");
@@ -150,8 +161,8 @@ pub fn build(b: *std.Build) !void {
             },
         }
 
-        // ntlmclient
-        {
+        // ntlmclient — only when enabled AND we have a TLS backend (NTLM needs crypto)
+        if (enable_ntlm and tls_backend != .none) {
             const ntlm = b.addLibrary(.{
                 .name = "ntlmclient",
                 .linkage = .static,
@@ -172,6 +183,7 @@ pub fn build(b: *std.Build) !void {
                     .openssl => "-DCRYPT_OPENSSL",
                     .mbedtls => "-DCRYPT_MBEDTLS",
                     .securetransport => "-DCRYPT_COMMONCRYPTO",
+                    .none => unreachable,
                 },
             };
             ntlm.addCSourceFiles(.{
@@ -180,6 +192,7 @@ pub fn build(b: *std.Build) !void {
                     .openssl => &.{"deps/ntlmclient/crypt_openssl.c"},
                     .mbedtls => &.{"deps/ntlmclient/crypt_mbedtls.c"},
                     .securetransport => &.{"deps/ntlmclient/crypt_commoncrypto.c"},
+                    .none => unreachable,
                 },
                 .flags = &ntlm_cflags,
             });
@@ -199,9 +212,15 @@ pub fn build(b: *std.Build) !void {
             .files = &util_unix_sources,
             .flags = &flags,
         });
+
+        // SHA256 hash implementation — depends on TLS backend
         lib.addCSourceFiles(.{
             .root = libgit_root,
             .files = switch (tls_backend) {
+                .none => &.{
+                    "src/util/hash/builtin.c",
+                    "src/util/hash/rfc6234/sha224-256.c",
+                },
                 .openssl => &.{"src/util/hash/openssl.c"},
                 .mbedtls => &.{"src/util/hash/mbedtls.c"},
                 .securetransport => &.{"src/util/hash/common_crypto.c"},
@@ -210,7 +229,7 @@ pub fn build(b: *std.Build) !void {
         });
     }
 
-    // SHA1 collisiondetect
+    // SHA1 collisiondetect (always needed)
     lib.addCSourceFiles(.{
         .root = libgit_root,
         .files = &util_sha1dc_sources,
@@ -226,12 +245,14 @@ pub fn build(b: *std.Build) !void {
         features.addValues(.{
             .GIT_SSH = 1,
             .GIT_SSH_LIBSSH2 = 1,
-            .GIT_SSH_LIBSSH2_MEMORY_CREDENTIALS = 1, // @Todo: check for `libssh2_userauth_publickey_frommemory`?
+            .GIT_SSH_LIBSSH2_MEMORY_CREDENTIALS = 1,
         });
     }
 
-    // Bundled dependencies
-    {
+    // --- Bundled dependencies ---
+
+    // llhttp (HTTP parser) — only when HTTP is enabled
+    if (enable_http) {
         const llhttp = b.addLibrary(.{
             .name = "llhttp",
             .linkage = .static,
@@ -252,6 +273,8 @@ pub fn build(b: *std.Build) !void {
         lib.linkLibrary(llhttp);
         features.addValues(.{ .GIT_HTTPPARSER_BUILTIN = 1 });
     }
+
+    // PCRE (regex) — needed on non-macOS
     if (target.result.os.tag != .macos) {
         const pcre = b.addLibrary(.{
             .name = "pcre",
@@ -292,8 +315,9 @@ pub fn build(b: *std.Build) !void {
         lib.linkLibrary(pcre);
         features.addValues(.{ .GIT_REGEX_BUILTIN = 1 });
     }
+
+    // zlib (always needed — pack compression)
     {
-        // @Todo: support using system zlib?
         const zlib = b.addLibrary(.{
             .name = "z",
             .linkage = .static,
@@ -322,16 +346,17 @@ pub fn build(b: *std.Build) !void {
         lib.linkLibrary(zlib);
         features.addValues(.{ .GIT_COMPRESSION_ZLIB = 1 });
     }
-    // xdiff
-    {
-        // Bundled xdiff dependency relies on libgit2 headers & utils, so we
-        // just add the source files directly instead of making a static lib step.
+
+    // xdiff include path is always needed (core sources reference xdiff headers)
+    lib.addIncludePath(libgit_src.path("deps/xdiff"));
+
+    // xdiff sources — only compiled when enabled (needed for merge, diff, apply)
+    if (enable_xdiff) {
         lib.addCSourceFiles(.{
             .root = libgit_root,
             .files = &xdiff_sources,
             .flags = &.{ "-Wno-sign-compare", "-Wno-unused-parameter" },
         });
-        lib.addIncludePath(libgit_src.path("deps/xdiff"));
     }
 
     switch (target.result.ptrBitWidth()) {
@@ -346,249 +371,253 @@ pub fn build(b: *std.Build) !void {
     lib.addIncludePath(libgit_src.path("src/util"));
     lib.addIncludePath(libgit_src.path("include"));
 
-    lib.addCSourceFiles(.{ .root = libgit_root, .files = &libgit_sources, .flags = &flags });
+    // --- Core library sources (always compiled) ---
+    lib.addCSourceFiles(.{ .root = libgit_root, .files = &core_sources, .flags = &flags });
     lib.addCSourceFiles(.{ .root = libgit_root, .files = &util_sources, .flags = &flags });
+
+    // --- Transport sources (only when transports are enabled) ---
+    // When disabled, the transport/stream .c files are simply not compiled.
+    // The C #ifdef guards inside them would make them empty stubs anyway,
+    // but skipping compilation entirely is cleaner and avoids pulling headers.
+    if (enable_transports) {
+        lib.addCSourceFiles(.{ .root = libgit_root, .files = &transport_sources, .flags = &flags });
+        lib.addCSourceFiles(.{ .root = libgit_root, .files = &stream_sources, .flags = &flags });
+        lib.addCSourceFiles(.{ .root = libgit_root, .files = &network_sources, .flags = &flags });
+    }
 
     lib.installHeadersDirectory(libgit_src.path("include"), "", .{});
     b.installArtifact(lib);
 
-    const cli_step = b.step("run-cli", "Build and run the command-line interface");
-    {
-        const cli = b.addExecutable(.{
-            .name = "git2_cli",
-            .root_module = b.createModule(.{
-                .target = target,
-                .optimize = optimize,
-                .link_libc = true,
-            }),
-        });
-
-        cli.addConfigHeader(features);
-        cli.addIncludePath(libgit_src.path("src/util"));
-        cli.addIncludePath(libgit_src.path("src/cli"));
-        maybeAddTlsIncludes(cli, tls_dep, tls_backend);
-
-        cli.linkLibrary(lib);
-        cli.addCSourceFiles(.{
-            .root = libgit_root,
-            .files = &cli_sources,
-            // @Todo: see above
-            // .flags = &.{"-std=c90"},
-        });
-        cli.addCSourceFiles(.{
-            .root = libgit_root,
-            .files = if (target.result.os.tag == .windows)
-                &.{"src/cli/win32/sighandler.c"}
-            else
-                &.{"src/cli/unix/sighandler.c"},
-        });
-
-        // independent install step so you can easily access the binary
-        const cli_install = b.addInstallArtifact(cli, .{});
-        const cli_run = b.addRunArtifact(cli);
-        if (b.args) |args| {
-            for (args) |arg| cli_run.addArg(arg);
-        }
-        cli_run.step.dependOn(&cli_install.step);
-        cli_step.dependOn(&cli_run.step);
-    }
-
-    const examples_step = b.step("run-example", "Build and run library usage example app");
-    {
-        const exe = b.addExecutable(.{
-            .name = "lg2",
-            .root_module = b.createModule(.{
-                .target = target,
-                .optimize = optimize,
-                .link_libc = true,
-            }),
-        });
-
-        exe.addIncludePath(libgit_src.path("examples"));
-        exe.addCSourceFiles(.{
-            .root = libgit_root,
-            .files = &example_sources,
-            .flags = &.{
-                // "-std=c90",
-                "-DGIT_DEPRECATE_HARD",
-            },
-        });
-
-        maybeAddTlsIncludes(exe, tls_dep, tls_backend);
-        exe.linkLibrary(lib);
-
-        // independent install step so you can easily access the binary
-        const examples_install = b.addInstallArtifact(exe, .{});
-        const example_run = b.addRunArtifact(exe);
-        if (b.args) |args| {
-            for (args) |arg| example_run.addArg(arg);
-        }
-        example_run.step.dependOn(&examples_install.step);
-        examples_step.dependOn(&example_run.step);
-    }
-
-    const test_step = b.step("test", "Run core unit tests (requires python)");
-    {
-        const gen_cmd = b.addSystemCommand(&.{"python3"});
-        gen_cmd.addFileArg(libgit_src.path("tests/clar/generate.py"));
-        const clar_suite = gen_cmd.addPrefixedOutputDirectoryArg("-o", "clar_suite");
-        gen_cmd.addArgs(&.{ "-f", "-xonline", "-xstress", "-xperf" });
-        gen_cmd.addDirectoryArg(libgit_src.path("tests/libgit2"));
-
-        // Copy the clar source so it can be modified below.
-        const clar_src = b.addWriteFiles().addCopyDirectory(
-            libgit_src.path("tests/clar"),
-            "clar_src",
-            .{},
-        );
-
-        const runner = b.addExecutable(.{
-            .name = "libgit2_tests",
-            .root_module = b.createModule(.{
-                .target = target,
-                .optimize = .Debug,
-                .link_libc = true,
-            }),
-        });
-        runner.addIncludePath(clar_suite);
-        runner.addIncludePath(clar_src);
-        runner.addIncludePath(libgit_src.path("tests/libgit2"));
-
-        runner.addConfigHeader(features);
-        runner.addIncludePath(libgit_src.path("src/util"));
-        runner.addIncludePath(libgit_src.path("src/libgit2"));
-
-        runner.addIncludePath(libgit_src.path("deps/zlib"));
-        runner.addIncludePath(libgit_src.path("deps/xdiff"));
-        runner.addIncludePath(libgit_src.path("deps/pcre"));
-        maybeAddTlsIncludes(runner, tls_dep, tls_backend);
-
-        runner.linkLibrary(lib);
-
-        const runner_flags = &.{
-            "-DCLAR_FIXTURE_PATH", // See clar_fix step below
-            "-DCLAR_TMPDIR=\"libgit2_tests\"",
-            "-DCLAR_WIN32_LONGPATHS",
-            "-DGIT_DEPRECATE_HARD",
-        };
-        runner.addCSourceFiles(.{
-            .root = libgit_src.path("tests/libgit2/"),
-            .files = &libgit2_test_sources,
-            .flags = runner_flags,
-        });
-        runner.addCSourceFiles(.{
-            .root = clar_src,
-            .files = &clar_sources,
-            .flags = runner_flags,
-        });
-
-        const resources_dir = switch (@import("builtin").os.tag) {
-            .windows => libgit_src.path("tests/resources/"),
-            else => dir: {
-                // Fix the test fixture file permissions. This is necessary because Zig does
-                // not respect the execute permission on arbitrary files it extracts from dependencies.
-                // Since we need those files to have the execute permission set for tests to
-                // run successfully, we need to patch them before we bake them into the
-                // test executable.
-                const resources_dir = b.addWriteFiles().addCopyDirectory(
-                    libgit_root.path(b, "tests/resources/"),
-                    "test_resources",
-                    .{},
-                );
-                const chmod = b.addExecutable(.{
-                    .name = "chmod",
-                    .root_module = b.createModule(.{
-                        .root_source_file = b.path("build/chmod.zig"),
-                        .target = b.graph.host,
-                    }),
-                });
-                const run_chmod = b.addRunArtifact(chmod);
-                run_chmod.addFileArg(resources_dir.path(b, "filemodes/exec_on"));
-                run_chmod.addFileArg(resources_dir.path(b, "filemodes/exec_off2on_staged"));
-                run_chmod.addFileArg(resources_dir.path(b, "filemodes/exec_off2on_workdir"));
-                run_chmod.addFileArg(resources_dir.path(b, "filemodes/exec_on_untracked"));
-                runner.step.dependOn(&run_chmod.step);
-
-                break :dir resources_dir;
-            },
-        };
+    // --- CLI tool (only when transports are enabled — it uses clone, fetch, etc.) ---
+    if (enable_transports) {
+        const cli_step = b.step("run-cli", "Build and run the command-line interface");
         {
-            // Clar hardcodes the path to resources_dir via the `-DCLAR_FIXTURE_PATH="..."` flag.
-            // This path isn't known at configure-time, so we have to create a dedicated build step.
-            // This step replaces *reads* of the `CLAR_FIXTURE_PATH` macro in a local-cache copy of the source code
-            // (see clar_src). Thankfully the macro is only read by `tests/clar/clar/fixture.h` once.
-            const clar_fix = b.addExecutable(.{
-                .name = "clar_fix",
+            const cli = b.addExecutable(.{
+                .name = "git2_cli",
                 .root_module = b.createModule(.{
-                    .root_source_file = b.path("build/clar_fix.zig"),
-                    .target = b.graph.host,
+                    .target = target,
+                    .optimize = optimize,
+                    .link_libc = true,
                 }),
             });
 
-            const run_fix = b.addRunArtifact(clar_fix);
-            // run_fix.has_side_effects = true; // @Todo is this necessary? What are the rules for cache invalidation with Run steps?
-            run_fix.addFileArg(clar_src.path(b, "clar/fixtures.h"));
-            run_fix.addDirectoryArg(resources_dir);
-            runner.step.dependOn(&run_fix.step);
+            cli.addConfigHeader(features);
+            cli.addIncludePath(libgit_src.path("src/util"));
+            cli.addIncludePath(libgit_src.path("src/cli"));
+            maybeAddTlsIncludes(cli, tls_dep, tls_backend);
+
+            cli.linkLibrary(lib);
+            cli.addCSourceFiles(.{
+                .root = libgit_root,
+                .files = &cli_sources,
+            });
+            cli.addCSourceFiles(.{
+                .root = libgit_root,
+                .files = if (target.result.os.tag == .windows)
+                    &.{"src/cli/win32/sighandler.c"}
+                else
+                    &.{"src/cli/unix/sighandler.c"},
+            });
+
+            const cli_install = b.addInstallArtifact(cli, .{});
+            const cli_run = b.addRunArtifact(cli);
+            if (b.args) |args| {
+                for (args) |arg| cli_run.addArg(arg);
+            }
+            cli_run.step.dependOn(&cli_install.step);
+            cli_step.dependOn(&cli_run.step);
         }
+    }
 
-        const TestHelper = struct {
-            b: *std.Build,
-            top_level_step: *std.Build.Step,
-            runner: *std.Build.Step.Compile,
+    // --- Examples (only when transports are enabled) ---
+    if (enable_transports) {
+        const examples_step = b.step("run-example", "Build and run library usage example app");
+        {
+            const exe = b.addExecutable(.{
+                .name = "lg2",
+                .root_module = b.createModule(.{
+                    .target = target,
+                    .optimize = optimize,
+                    .link_libc = true,
+                }),
+            });
 
-            const ClarStep = @import("build/ClarTestStep.zig");
+            exe.addIncludePath(libgit_src.path("examples"));
+            exe.addCSourceFiles(.{
+                .root = libgit_root,
+                .files = &example_sources,
+                .flags = &.{
+                    "-DGIT_DEPRECATE_HARD",
+                },
+            });
 
-            fn addTest(
-                self: @This(),
-                name: []const u8,
-                args: []const []const u8,
-            ) void {
-                const clar = ClarStep.create(self.b, name, self.runner);
-                self.top_level_step.dependOn(&clar.step);
-                clar.addArgs(args);
+            maybeAddTlsIncludes(exe, tls_dep, tls_backend);
+            exe.linkLibrary(lib);
+
+            const examples_install = b.addInstallArtifact(exe, .{});
+            const example_run = b.addRunArtifact(exe);
+            if (b.args) |args| {
+                for (args) |arg| example_run.addArg(arg);
+            }
+            example_run.step.dependOn(&examples_install.step);
+            examples_step.dependOn(&example_run.step);
+        }
+    }
+
+    // --- Tests (only when transports are enabled — tests assume full build) ---
+    if (enable_transports) {
+        const test_step = b.step("test", "Run core unit tests (requires python)");
+        {
+            const gen_cmd = b.addSystemCommand(&.{"python3"});
+            gen_cmd.addFileArg(libgit_src.path("tests/clar/generate.py"));
+            const clar_suite = gen_cmd.addPrefixedOutputDirectoryArg("-o", "clar_suite");
+            gen_cmd.addArgs(&.{ "-f", "-xonline", "-xstress", "-xperf" });
+            gen_cmd.addDirectoryArg(libgit_src.path("tests/libgit2"));
+
+            const clar_src = b.addWriteFiles().addCopyDirectory(
+                libgit_src.path("tests/clar"),
+                "clar_src",
+                .{},
+            );
+
+            const runner = b.addExecutable(.{
+                .name = "libgit2_tests",
+                .root_module = b.createModule(.{
+                    .target = target,
+                    .optimize = .Debug,
+                    .link_libc = true,
+                }),
+            });
+            runner.addIncludePath(clar_suite);
+            runner.addIncludePath(clar_src);
+            runner.addIncludePath(libgit_src.path("tests/libgit2"));
+
+            runner.addConfigHeader(features);
+            runner.addIncludePath(libgit_src.path("src/util"));
+            runner.addIncludePath(libgit_src.path("src/libgit2"));
+
+            runner.addIncludePath(libgit_src.path("deps/zlib"));
+            runner.addIncludePath(libgit_src.path("deps/xdiff"));
+            runner.addIncludePath(libgit_src.path("deps/pcre"));
+            maybeAddTlsIncludes(runner, tls_dep, tls_backend);
+
+            runner.linkLibrary(lib);
+
+            const runner_flags = &.{
+                "-DCLAR_FIXTURE_PATH",
+                "-DCLAR_TMPDIR=\"libgit2_tests\"",
+                "-DCLAR_WIN32_LONGPATHS",
+                "-DGIT_DEPRECATE_HARD",
+            };
+            runner.addCSourceFiles(.{
+                .root = libgit_src.path("tests/libgit2/"),
+                .files = &libgit2_test_sources,
+                .flags = runner_flags,
+            });
+            runner.addCSourceFiles(.{
+                .root = clar_src,
+                .files = &clar_sources,
+                .flags = runner_flags,
+            });
+
+            const resources_dir = switch (@import("builtin").os.tag) {
+                .windows => libgit_src.path("tests/resources/"),
+                else => dir: {
+                    const resources_dir = b.addWriteFiles().addCopyDirectory(
+                        libgit_root.path(b, "tests/resources/"),
+                        "test_resources",
+                        .{},
+                    );
+                    const chmod = b.addExecutable(.{
+                        .name = "chmod",
+                        .root_module = b.createModule(.{
+                            .root_source_file = b.path("build/chmod.zig"),
+                            .target = b.graph.host,
+                        }),
+                    });
+                    const run_chmod = b.addRunArtifact(chmod);
+                    run_chmod.addFileArg(resources_dir.path(b, "filemodes/exec_on"));
+                    run_chmod.addFileArg(resources_dir.path(b, "filemodes/exec_off2on_staged"));
+                    run_chmod.addFileArg(resources_dir.path(b, "filemodes/exec_off2on_workdir"));
+                    run_chmod.addFileArg(resources_dir.path(b, "filemodes/exec_on_untracked"));
+                    runner.step.dependOn(&run_chmod.step);
+
+                    break :dir resources_dir;
+                },
+            };
+            {
+                const clar_fix = b.addExecutable(.{
+                    .name = "clar_fix",
+                    .root_module = b.createModule(.{
+                        .root_source_file = b.path("build/clar_fix.zig"),
+                        .target = b.graph.host,
+                    }),
+                });
+
+                const run_fix = b.addRunArtifact(clar_fix);
+                run_fix.addFileArg(clar_src.path(b, "clar/fixtures.h"));
+                run_fix.addDirectoryArg(resources_dir);
+                runner.step.dependOn(&run_fix.step);
             }
 
-            fn addTestFiltered(
-                self: @This(),
-                name: []const u8,
-                /// Comma seperated list of tests
-                tests: []const u8,
-            ) void {
-                const clar = ClarStep.create(self.b, name, self.runner);
-                self.top_level_step.dependOn(&clar.step);
-                var iter = std.mem.tokenizeScalar(u8, tests, ',');
-                while (iter.next()) |filter| {
-                    clar.addArg(self.b.fmt("-s{s}", .{filter}));
+            const TestHelper = struct {
+                b: *std.Build,
+                top_level_step: *std.Build.Step,
+                runner: *std.Build.Step.Compile,
+
+                const ClarStep = @import("build/ClarTestStep.zig");
+
+                fn addTest(
+                    self: @This(),
+                    name: []const u8,
+                    args: []const []const u8,
+                ) void {
+                    const clar = ClarStep.create(self.b, name, self.runner);
+                    self.top_level_step.dependOn(&clar.step);
+                    clar.addArgs(args);
                 }
+
+                fn addTestFiltered(
+                    self: @This(),
+                    name: []const u8,
+                    /// Comma seperated list of tests
+                    tests: []const u8,
+                ) void {
+                    const clar = ClarStep.create(self.b, name, self.runner);
+                    self.top_level_step.dependOn(&clar.step);
+                    var iter = std.mem.tokenizeScalar(u8, tests, ',');
+                    while (iter.next()) |filter| {
+                        clar.addArg(self.b.fmt("-s{s}", .{filter}));
+                    }
+                }
+            };
+
+            const helper: TestHelper = .{
+                .b = b,
+                .top_level_step = test_step,
+                .runner = runner,
+            };
+
+            if (b.option([]const u8, "test-filter", "Comma seperated list of specific tests to run")) |tests| {
+                helper.addTestFiltered("filtered", tests);
+            } else {
+                helper.addTest("auth_clone", &.{"-sonline::clone::cred"});
+                helper.addTest("auth_clone_and_push", &.{ "-sonline::clone::push", "-sonline::push" });
+                helper.addTest("gitdaemon", &.{"-sonline::push"});
+                helper.addTest("gitdaemon_namespace", &.{"-sonline::clone::namespace"});
+                helper.addTest("gitdaemon_sha256", &.{"-sonline::clone::sha256"});
+                helper.addTest("invasive", &.{ "-sfilter::stream::bigfile", "-sodb::largefiles", "-siterator::workdir::filesystem_gunk", "-srepo::init", "-srepo::init::at_filesystem_root", "-sonline::clone::connect_timeout_default" });
+                helper.addTest("offline", &.{"-xonline"});
+                helper.addTest("online", &.{ "-sonline", "-xonline::customcert" });
+                helper.addTest("online_customcert", &.{"-sonline::customcert"});
+                helper.addTest("proxy", &.{"-sonline::clone::proxy"});
+                helper.addTest("ssh", &.{ "-sonline::push", "-sonline::clone::ssh_cert", "-sonline::clone::ssh_with_paths", "-sonline::clone::path_whitespace_ssh", "-sonline::clone::ssh_auth_methods" });
             }
-        };
-
-        const helper: TestHelper = .{
-            .b = b,
-            .top_level_step = test_step,
-            .runner = runner,
-        };
-
-        if (b.option([]const u8, "test-filter", "Comma seperated list of specific tests to run")) |tests| {
-            helper.addTestFiltered("filtered", tests);
-        } else {
-            helper.addTest("auth_clone", &.{"-sonline::clone::cred"});
-            helper.addTest("auth_clone_and_push", &.{ "-sonline::clone::push", "-sonline::push" });
-            helper.addTest("gitdaemon", &.{"-sonline::push"});
-            helper.addTest("gitdaemon_namespace", &.{"-sonline::clone::namespace"});
-            helper.addTest("gitdaemon_sha256", &.{"-sonline::clone::sha256"});
-            helper.addTest("invasive", &.{ "-sfilter::stream::bigfile", "-sodb::largefiles", "-siterator::workdir::filesystem_gunk", "-srepo::init", "-srepo::init::at_filesystem_root", "-sonline::clone::connect_timeout_default" });
-            helper.addTest("offline", &.{"-xonline"});
-            helper.addTest("online", &.{ "-sonline", "-xonline::customcert" });
-            helper.addTest("online_customcert", &.{"-sonline::customcert"});
-            helper.addTest("proxy", &.{"-sonline::clone::proxy"});
-            helper.addTest("ssh", &.{ "-sonline::push", "-sonline::clone::ssh_cert", "-sonline::clone::ssh_with_paths", "-sonline::clone::path_whitespace_ssh", "-sonline::clone::ssh_auth_methods" });
         }
     }
 }
 
-pub const TlsBackend = enum { openssl, mbedtls, securetransport };
+pub const TlsBackend = enum { none, openssl, mbedtls, securetransport };
 
 fn maybeAddTlsIncludes(
     compile: *std.Build.Step.Compile,
@@ -597,7 +626,7 @@ fn maybeAddTlsIncludes(
 ) void {
     if (dep) |tls| {
         const name = switch (backend) {
-            .securetransport => unreachable,
+            .securetransport, .none => unreachable,
             .openssl => "openssl",
             .mbedtls => "mbedtls",
         };
@@ -605,7 +634,20 @@ fn maybeAddTlsIncludes(
     }
 }
 
-const libgit_sources = [_][]const u8{
+// =============================================================================
+// Source file lists
+// =============================================================================
+//
+// The original monolithic libgit_sources has been split into:
+//   core_sources      — always compiled (ODB, pack, refs, revwalk, objects, repo, config, ...)
+//   transport_sources — git transport layer (transports/*.c) — gated by enable-transports
+//   stream_sources    — TLS/socket streams (streams/*.c) — gated by enable-transports
+//   network_sources   — high-level network operations (fetch, push, clone, remote, ...) — gated by enable-transports
+//
+// This split lets embedders build just the git object database / pack / ref
+// plumbing without pulling in any network, TLS, or HTTP dependencies.
+
+const core_sources = [_][]const u8{
     "src/libgit2/annotated_commit.c",
     "src/libgit2/apply.c",
     "src/libgit2/attr.c",
@@ -619,7 +661,6 @@ const libgit_sources = [_][]const u8{
     "src/libgit2/cache.c",
     "src/libgit2/checkout.c",
     "src/libgit2/cherrypick.c",
-    "src/libgit2/clone.c",
     "src/libgit2/commit.c",
     "src/libgit2/commit_graph.c",
     "src/libgit2/commit_list.c",
@@ -643,8 +684,6 @@ const libgit_sources = [_][]const u8{
     "src/libgit2/diff_tform.c",
     "src/libgit2/diff_xdiff.c",
     "src/libgit2/email.c",
-    "src/libgit2/fetch.c",
-    "src/libgit2/fetchhead.c",
     "src/libgit2/filter.c",
     "src/libgit2/grafts.c",
     "src/libgit2/graph.c",
@@ -681,7 +720,6 @@ const libgit_sources = [_][]const u8{
     "src/libgit2/path.c",
     "src/libgit2/pathspec.c",
     "src/libgit2/proxy.c",
-    "src/libgit2/push.c",
     "src/libgit2/reader.c",
     "src/libgit2/rebase.c",
     "src/libgit2/refdb.c",
@@ -689,7 +727,6 @@ const libgit_sources = [_][]const u8{
     "src/libgit2/reflog.c",
     "src/libgit2/refs.c",
     "src/libgit2/refspec.c",
-    "src/libgit2/remote.c",
     "src/libgit2/repository.c",
     "src/libgit2/reset.c",
     "src/libgit2/revert.c",
@@ -700,15 +737,6 @@ const libgit_sources = [_][]const u8{
     "src/libgit2/stash.c",
     "src/libgit2/status.c",
     "src/libgit2/strarray.c",
-    "src/libgit2/streams/mbedtls.c",
-    "src/libgit2/streams/openssl.c",
-    "src/libgit2/streams/openssl_dynamic.c",
-    "src/libgit2/streams/openssl_legacy.c",
-    "src/libgit2/streams/registry.c",
-    "src/libgit2/streams/schannel.c",
-    "src/libgit2/streams/socket.c",
-    "src/libgit2/streams/stransport.c",
-    "src/libgit2/streams/tls.c",
     "src/libgit2/submodule.c",
     "src/libgit2/sysdir.c",
     "src/libgit2/tag.c",
@@ -716,6 +744,25 @@ const libgit_sources = [_][]const u8{
     "src/libgit2/trailer.c",
     "src/libgit2/transaction.c",
     "src/libgit2/transport.c",
+    "src/libgit2/tree-cache.c",
+    "src/libgit2/tree.c",
+    "src/libgit2/worktree.c",
+};
+
+// Network-level sources — these implement fetch/push/clone/remote which
+// depend on the transport layer. Only compiled when enable-transports=true.
+const network_sources = [_][]const u8{
+    "src/libgit2/clone.c",
+    "src/libgit2/fetch.c",
+    "src/libgit2/fetchhead.c",
+    "src/libgit2/push.c",
+    "src/libgit2/remote.c",
+};
+
+// Transport protocol implementations.
+// All guarded by enable-transports. Individual protocols are further
+// guarded by C preprocessor #ifdefs (GIT_SSH, GIT_HTTPS, GIT_WINHTTP, etc.)
+const transport_sources = [_][]const u8{
     "src/libgit2/transports/auth.c",
     "src/libgit2/transports/auth_gssapi.c",
     "src/libgit2/transports/auth_ntlmclient.c",
@@ -734,9 +781,20 @@ const libgit_sources = [_][]const u8{
     "src/libgit2/transports/ssh_exec.c",
     "src/libgit2/transports/ssh_libssh2.c",
     "src/libgit2/transports/winhttp.c",
-    "src/libgit2/tree-cache.c",
-    "src/libgit2/tree.c",
-    "src/libgit2/worktree.c",
+};
+
+// Stream implementations (TLS, socket, etc.)
+// Only compiled when enable-transports=true.
+const stream_sources = [_][]const u8{
+    "src/libgit2/streams/mbedtls.c",
+    "src/libgit2/streams/openssl.c",
+    "src/libgit2/streams/openssl_dynamic.c",
+    "src/libgit2/streams/openssl_legacy.c",
+    "src/libgit2/streams/registry.c",
+    "src/libgit2/streams/schannel.c",
+    "src/libgit2/streams/socket.c",
+    "src/libgit2/streams/stransport.c",
+    "src/libgit2/streams/tls.c",
 };
 
 const util_sources = [_][]const u8{
