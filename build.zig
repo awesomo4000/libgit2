@@ -405,6 +405,15 @@ pub fn build(b: *std.Build) !void {
         lib.addCSourceFiles(.{ .root = libgit_root, .files = &transport_sources, .flags = &flags });
         lib.addCSourceFiles(.{ .root = libgit_root, .files = &stream_sources, .flags = &flags });
         lib.addCSourceFiles(.{ .root = libgit_root, .files = &network_sources, .flags = &flags });
+    } else {
+        // When transports are disabled, core sources (libgit2.c, settings.c,
+        // branch.c, submodule.c) still reference transport/stream/remote symbols.
+        // Compile no-op stubs to satisfy the linker.
+        lib.addCSourceFiles(.{
+            .root = b.path("."),
+            .files = &.{"src/transport_stubs.c"},
+            .flags = &flags,
+        });
     }
 
     lib.installHeadersDirectory(libgit_src.path("include"), "", .{});
