@@ -17,6 +17,15 @@ const allocator = std.heap.c_allocator;
 /// Sentinel value matching POSIX `(iconv_t)-1`.
 const ICONV_ERROR: usize = @as(usize, 0) -% 1;
 
+/// Return true for descriptors that cannot be valid heap pointers.
+/// Covers (iconv_t)-1, NULL, and any badly-aligned value.
+fn isInvalidDescriptor(cd: usize) bool {
+    if (cd == ICONV_ERROR or cd == 0) return true;
+    // Reject pointers that are not aligned to IconvState.
+    if (cd % @alignOf(IconvState) != 0) return true;
+    return false;
+}
+
 const Mode = enum { nfc, identity };
 
 const IconvState = struct {
@@ -71,6 +80,10 @@ export fn iconv(
     // NULL inbuf → reset state (nothing to do for our stateless normaliser).
     if (inbuf_ptr == null) return 0;
 
+    if (isInvalidDescriptor(cd)) {
+        setErrno(.BADF);
+        return ICONV_ERROR;
+    }
     const state: *IconvState = @ptrFromInt(cd);
     const in = inbuf_ptr.?;
     const in_left = inbytesleft.?;
@@ -134,6 +147,10 @@ export fn iconv(
 // ── iconv_close ─────────────────────────────────────────────────────────
 
 export fn iconv_close(cd: usize) c_int {
+    if (isInvalidDescriptor(cd)) {
+        setErrno(.BADF);
+        return -1;
+    }
     const state: *IconvState = @ptrFromInt(cd);
     if (state.mode == .nfc) {
         state.norm.deinit(allocator);

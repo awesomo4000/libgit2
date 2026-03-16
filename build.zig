@@ -419,6 +419,25 @@ pub fn build(b: *std.Build) !void {
     lib.installHeadersDirectory(libgit_src.path("include"), "", .{});
     b.installArtifact(lib);
 
+    // --- iconv shim test (exercises libgit2 the way gob does) ---
+    {
+        const iconv_test = b.addExecutable(.{
+            .name = "test_iconv",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/test_iconv.zig"),
+                .target = target,
+                .optimize = optimize,
+                .link_libc = true,
+            }),
+        });
+        iconv_test.linkLibrary(lib);
+        b.installArtifact(iconv_test);
+
+        const run_iconv_test = b.addRunArtifact(iconv_test);
+        const iconv_test_step = b.step("test-iconv", "Run iconv shim test");
+        iconv_test_step.dependOn(&run_iconv_test.step);
+    }
+
     // --- CLI tool (only when transports are enabled — it uses clone, fetch, etc.) ---
     if (enable_transports) {
         const cli_step = b.step("run-cli", "Build and run the command-line interface");
